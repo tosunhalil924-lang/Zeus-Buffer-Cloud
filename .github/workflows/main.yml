@@ -1,0 +1,26 @@
+name: Prime Otonom Logic
+on:
+  repository_dispatch:
+    types: [prime_loop]
+  workflow_dispatch: # Manuel başlatma için
+
+jobs:
+  prime-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🛠️ System Prep
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update && sudo apt-get install -y jq curl git
+
+      - name: 🚀 Run Prime Worker
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MIYSOFT_KEY: ${{ secrets.MIYSOFT_KEY }}
+          WORKER_ID: ${{ github.event.client_payload.worker_id || 1 }}
+        run: |
+          chmod +x worker_prime.sh
+          ./worker_prime.sh
